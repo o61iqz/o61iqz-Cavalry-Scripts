@@ -1,31 +1,47 @@
 /**
  * o61_KeyframeCurve
- * 
+ *
  * Copyright (c) 2026 o61iqz.
  * Licensed under the MIT License.
- * 
+ *
  * Author: o61iqz
- * Version: 1.0.0
+ * Version: 1.0.1
  *
  * UI script that applies cubic-bezier curves to selected keyframes.
  * Run from Cavalry's JavaScript Editor or Scripts menu.
- * 
+ *
  * Changelog:
- * - Initial release.
+ * - Refactored preset persistence and preset browser UI into dedicated manager/view modules.
+ * - Split curve editor behavior into CurveEditor and shared drawing helpers.
+ * - Added reusable deferred UI rebuild scheduling and reduced loose loader state.
  */
 
 (function() {
-    var internalPresets = {
+    var BUILT_IN_PRESETS = {
         "Ease": [0.25, 0.1, 0.25, 1.0],
         "Ease In": [0.5, 0.0, 1.0, 1.0],
         "Ease Out": [0.0, 0.0, 0.5, 1.0],
         "Ease In Out": [0.5, 0.0, 0.5, 1.0],
         "Linear": [0.0, 0.0, 1.0, 1.0]
     };
-    var customPresetNames = [];
-    var favoritePresetNames = [];
-    var lastUsedPresetName = "";
-    var presetStorageFileName = "o61_KeyframeCurve.presets.json";
+
+    var PRESET_STORAGE_FILE = "o61_KeyframeCurve.presets.json";
+    var COLORS = {
+        background: "#1d1f23",
+        card: "#23262c",
+        selectedCard: "#2f3340",
+        frame: "#454a52",
+        guide: "#2f333a",
+        handles: "#657180",
+        curve: "#4ffd7a",
+        endpoint: "#9aa4b2",
+        p1: "#36c9ff",
+        p2: "#ff8a3d",
+        starBox: "#15171b",
+        star: "#d8d8d8",
+        text: "#e8e8e8",
+        header: "#b8c0cc"
+    };
 
     function clamp(value, min, max) {
         return Math.max(min, Math.min(max, value));
@@ -35,229 +51,13 @@
         return Math.round(clamp(v, 0, 1) * 100) / 100;
     }
 
-    function getPresetStoragePath() {
-        if (!ui.scriptLocation) return "";
-        return ui.scriptLocation + "/" + presetStorageFileName;
-    }
-
-    function loadPersistedPresets() {
-        var path = getPresetStoragePath();
-        if (!path) return;
-        try {
-            if (typeof api.readFromFile !== "function") return;
-            var text = api.readFromFile(path);
-            if (!text) return;
-            var parsed = JSON.parse(text);
-            if (!parsed || typeof parsed !== "object") return;
-            var presetData = parsed.presets && typeof parsed.presets === "object" ? parsed.presets : parsed;
-            var favorites = Array.isArray(parsed.favorites) ? parsed.favorites : [];
-            if (typeof parsed.lastUsedPreset === "string") {
-                lastUsedPresetName = parsed.lastUsedPreset;
-            }
-            for (var f = 0; f < favorites.length; f++) {
-                if (typeof favorites[f] === "string" && favoritePresetNames.indexOf(favorites[f]) < 0) {
-                    favoritePresetNames.push(favorites[f]);
-                }
-            }
-            for (var name in presetData) {
-                if (!Object.prototype.hasOwnProperty.call(presetData, name)) continue;
-                var curve = presetData[name];
-                if (!Array.isArray(curve) || curve.length !== 4) continue;
-                internalPresets[name] = [
-                    round2Unit(curve[0]),
-                    round2Unit(curve[1]),
-                    round2Unit(curve[2]),
-                    round2Unit(curve[3])
-                ];
-                if (customPresetNames.indexOf(name) < 0) customPresetNames.push(name);
-            }
-        } catch (err) {
-            console.warn("Could not load preset storage: " + err);
-        }
-    }
-
-    function savePersistedPresets() {
-        var path = getPresetStoragePath();
-        if (!path) return;
-        try {
-            if (typeof api.writeToFile !== "function") return;
-            var toSave = {
-                presets: {},
-                favorites: [],
-                lastUsedPreset: lastUsedPresetName
-            };
-            for (var i = 0; i < customPresetNames.length; i++) {
-                var name = customPresetNames[i];
-                if (internalPresets[name]) toSave.presets[name] = internalPresets[name];
-            }
-            for (var f = 0; f < favoritePresetNames.length; f++) {
-                var favName = favoritePresetNames[f];
-                if (internalPresets[favName]) toSave.favorites.push(favName);
-            }
-            api.writeToFile(path, JSON.stringify(toSave, null, 2), true);
-        } catch (err) {
-            console.warn("Could not save preset storage: " + err);
-        }
-    }
-
-    function parseSelectedPath(path) {
-        var firstDot = path.indexOf(".");
-        if (firstDot < 0) return null;
-        return {
-            layerId: path.substring(0, firstDot),
-            attrId: path.substring(firstDot + 1)
-        };
-    }
-
-    function getValueAtFrame(layerId, attrId, frame, originalFrame) {
-        api.setFrame(frame);
-        var value = api.get(layerId, attrId);
-        api.setFrame(originalFrame);
-        return value;
-    }
-
-    function asNumber(value) {
-        if (typeof value === "number") return value;
-        return NaN;
-    }
-
-    function applyCurveToSelection(curve) {
-        var x1 = round2Unit(curve[0]);
-        var y1 = round2Unit(curve[1]);
-        var x2 = round2Unit(curve[2]);
-        var y2 = round2Unit(curve[3]);
-
-        var selected = api.getSelectedKeyframes();
-        var totalKeys = 0;
-        var totalAttrs = 0;
-        var currentFrame = api.getFrame();
-
-        for (var path in selected) {
-            if (!Object.prototype.hasOwnProperty.call(selected, path)) continue;
-
-            var parsed = parseSelectedPath(path);
-            if (!parsed) continue;
-
-            var selectedFrames = selected[path];
-            if (!Array.isArray(selectedFrames) || selectedFrames.length === 0) continue;
-
-            var selectedFrameMap = {};
-            for (var s = 0; s < selectedFrames.length; s++) {
-                selectedFrameMap[selectedFrames[s]] = true;
-            }
-
-            var allFrames = api.getKeyframeTimes(parsed.layerId, parsed.attrId);
-            if (!Array.isArray(allFrames) || allFrames.length === 0) continue;
-
-            allFrames.sort(function(a, b) { return a - b; });
-            totalAttrs += 1;
-
-            for (var i = 0; i < selectedFrames.length; i++) {
-                var frame = selectedFrames[i];
-                var index = allFrames.indexOf(frame);
-                if (index < 0) continue;
-
-                var keyData = {};
-                keyData[parsed.attrId] = { frame: frame, type: 0 };
-                api.modifyKeyframe(parsed.layerId, keyData);
-
-                var unlockData = {};
-                unlockData[parsed.attrId] = {
-                    frame: frame,
-                    angleLocked: false,
-                    weightLocked: false
-                };
-                api.modifyKeyframeTangent(parsed.layerId, unlockData);
-
-                var currentValue = asNumber(getValueAtFrame(parsed.layerId, parsed.attrId, frame, currentFrame));
-                if (isNaN(currentValue)) continue;
-
-                if (index < allFrames.length - 1) {
-                    var nextFrame = allFrames[index + 1];
-                    var nextValue = asNumber(getValueAtFrame(parsed.layerId, parsed.attrId, nextFrame, currentFrame));
-                    if (selectedFrameMap[nextFrame] && !isNaN(nextValue)) {
-                        var outX = frame + (nextFrame - frame) * x1;
-                        var outY = currentValue + (nextValue - currentValue) * y1;
-                        var outData = {};
-                        outData[parsed.attrId] = {
-                            frame: frame,
-                            outHandle: true,
-                            angleLocked: false,
-                            weightLocked: false,
-                            xValue: outX,
-                            yValue: outY
-                        };
-                        api.modifyKeyframeTangent(parsed.layerId, outData);
-                    }
-                }
-
-                if (index > 0) {
-                    var prevFrame = allFrames[index - 1];
-                    var prevValue = asNumber(getValueAtFrame(parsed.layerId, parsed.attrId, prevFrame, currentFrame));
-                    if (selectedFrameMap[prevFrame] && !isNaN(prevValue)) {
-                        var inX = prevFrame + (frame - prevFrame) * x2;
-                        var inY = prevValue + (currentValue - prevValue) * y2;
-                        var inData = {};
-                        inData[parsed.attrId] = {
-                            frame: frame,
-                            inHandle: true,
-                            angleLocked: false,
-                            weightLocked: false,
-                            xValue: inX,
-                            yValue: inY
-                        };
-                        api.modifyKeyframeTangent(parsed.layerId, inData);
-                    }
-                }
-
-                totalKeys += 1;
-            }
-        }
-
-        api.setFrame(currentFrame);
-
-        if (totalKeys === 0) {
-            console.warn("No numeric selected keyframes found.");
-        } else {
-            console.log("Applied curve to " + totalKeys + " keyframe(s) across " + totalAttrs + " attribute(s).");
-        }
-    }
-
-    function repopulatePresetDropDown(dropdown, preferredText) {
-        dropdown.clear();
-        var keys = Object.keys(internalPresets);
-        keys.sort();
-        for (var i = 0; i < keys.length; i++) {
-            dropdown.addEntry(keys[i]);
-        }
-        if (preferredText && internalPresets[preferredText]) {
-            dropdown.setText(preferredText);
-        } else if (keys.length > 0) {
-            dropdown.setValue(0);
-        }
-    }
-
-    function updateFieldsFromCurve(fields, curve) {
-        fields.x1.setValue(round2Unit(curve[0]));
-        fields.y1.setValue(round2Unit(curve[1]));
-        fields.x2.setValue(round2Unit(curve[2]));
-        fields.y2.setValue(round2Unit(curve[3]));
-    }
-
-    function getCurveFromFields(fields) {
+    function copyCurve(curve) {
         return [
-            round2Unit(fields.x1.getValue()),
-            round2Unit(fields.y1.getValue()),
-            round2Unit(fields.x2.getValue()),
-            round2Unit(fields.y2.getValue())
+            round2Unit(curve[0]),
+            round2Unit(curve[1]),
+            round2Unit(curve[2]),
+            round2Unit(curve[3])
         ];
-    }
-
-    function makeNumericField(defaultValue) {
-        var input = new ui.NumericField(defaultValue);
-        input.setType(1);
-        input.setStep(0.01);
-        return input;
     }
 
     function shortenName(text, maxLen) {
@@ -281,162 +81,655 @@
         return { width: 360, height: 360 };
     }
 
-    function createPresetPreviewDraw(curve, name) {
+    function makeNumericField(defaultValue) {
+        var input = new ui.NumericField(defaultValue);
+        input.setType(1);
+        input.setStep(0.01);
+        input.setFixedHeight(18);
+        return input;
+    }
+
+    function getCurveFromFields(fields) {
+        return [
+            round2Unit(fields.x1.getValue()),
+            round2Unit(fields.y1.getValue()),
+            round2Unit(fields.x2.getValue()),
+            round2Unit(fields.y2.getValue())
+        ];
+    }
+
+    function updateFieldsFromCurve(fields, curve) {
+        fields.x1.setValue(round2Unit(curve[0]));
+        fields.y1.setValue(round2Unit(curve[1]));
+        fields.x2.setValue(round2Unit(curve[2]));
+        fields.y2.setValue(round2Unit(curve[3]));
+    }
+
+    function safeSetText(widget, text) {
+        if (widget && typeof widget.setText === "function") {
+            widget.setText(text);
+        }
+    }
+
+    function DeferredTask(callback, delayMs) {
+        this.callback = callback;
+        this.delayMs = delayMs || 1;
+        this.pending = false;
+        this.timer = null;
+    }
+
+    DeferredTask.prototype.run = function() {
+        this.pending = false;
+        if (this.timer && typeof this.timer.stop === "function") this.timer.stop();
+        this.callback();
+    };
+
+    DeferredTask.prototype.schedule = function() {
+        if (this.pending) return;
+        this.pending = true;
+        if (typeof api.Timer !== "function") {
+            this.run();
+            return;
+        }
+        if (!this.timer) {
+            var task = this;
+            function TimerCallbacks() {
+                this.onTimeout = function() { task.run(); };
+            }
+            this.timer = new api.Timer(new TimerCallbacks());
+            this.timer.setRepeating(false);
+            this.timer.setInterval(this.delayMs);
+        }
+        this.timer.start();
+    };
+
+    function PresetsManager(builtIns, storageFileName) {
+        this.presets = {};
+        this.customNames = [];
+        this.favoriteNames = [];
+        this.lastUsedName = "";
+        this.storageFileName = storageFileName;
+
+        for (var name in builtIns) {
+            if (Object.prototype.hasOwnProperty.call(builtIns, name)) {
+                this.presets[name] = copyCurve(builtIns[name]);
+            }
+        }
+    }
+
+    PresetsManager.prototype.storagePath = function() {
+        if (!ui.scriptLocation) return "";
+        return ui.scriptLocation + "/" + this.storageFileName;
+    };
+
+    PresetsManager.prototype.load = function() {
+        var path = this.storagePath();
+        if (!path) return;
+        try {
+            if (typeof api.readFromFile !== "function") return;
+            var text = api.readFromFile(path);
+            if (!text) return;
+            var parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== "object") return;
+
+            var presetData = parsed.presets && typeof parsed.presets === "object" ? parsed.presets : parsed;
+            var favorites = Array.isArray(parsed.favorites) ? parsed.favorites : [];
+            if (typeof parsed.lastUsedPreset === "string") {
+                this.lastUsedName = parsed.lastUsedPreset;
+            }
+
+            for (var f = 0; f < favorites.length; f++) {
+                if (typeof favorites[f] === "string" && this.favoriteNames.indexOf(favorites[f]) < 0) {
+                    this.favoriteNames.push(favorites[f]);
+                }
+            }
+
+            for (var name in presetData) {
+                if (!Object.prototype.hasOwnProperty.call(presetData, name)) continue;
+                var curve = presetData[name];
+                if (!Array.isArray(curve) || curve.length !== 4) continue;
+                this.presets[name] = copyCurve(curve);
+                if (this.customNames.indexOf(name) < 0) this.customNames.push(name);
+            }
+            this.prune();
+        } catch (err) {
+            console.warn("Could not load preset storage: " + err);
+        }
+    };
+
+    PresetsManager.prototype.save = function() {
+        var path = this.storagePath();
+        if (!path) return;
+        try {
+            if (typeof api.writeToFile !== "function") return;
+            this.prune();
+            var data = {
+                presets: {},
+                favorites: [],
+                lastUsedPreset: this.lastUsedName
+            };
+            for (var i = 0; i < this.customNames.length; i++) {
+                var customName = this.customNames[i];
+                if (this.presets[customName]) data.presets[customName] = this.presets[customName];
+            }
+            for (var f = 0; f < this.favoriteNames.length; f++) {
+                var favName = this.favoriteNames[f];
+                if (this.presets[favName]) data.favorites.push(favName);
+            }
+            api.writeToFile(path, JSON.stringify(data, null, 2), true);
+        } catch (err) {
+            console.warn("Could not save preset storage: " + err);
+        }
+    };
+
+    PresetsManager.prototype.prune = function() {
+        for (var i = this.customNames.length - 1; i >= 0; i--) {
+            if (!this.presets[this.customNames[i]]) this.customNames.splice(i, 1);
+        }
+        for (var f = this.favoriteNames.length - 1; f >= 0; f--) {
+            if (!this.presets[this.favoriteNames[f]]) this.favoriteNames.splice(f, 1);
+        }
+        if (this.lastUsedName && !this.presets[this.lastUsedName]) this.lastUsedName = "";
+    };
+
+    PresetsManager.prototype.names = function() {
+        var names = Object.keys(this.presets);
+        names.sort();
+        return names;
+    };
+
+    PresetsManager.prototype.curve = function(name) {
+        return this.presets[name] ? copyCurve(this.presets[name]) : null;
+    };
+
+    PresetsManager.prototype.has = function(name) {
+        return !!this.presets[name];
+    };
+
+    PresetsManager.prototype.isCustom = function(name) {
+        return this.customNames.indexOf(name) >= 0;
+    };
+
+    PresetsManager.prototype.isFavorite = function(name) {
+        return this.favoriteNames.indexOf(name) >= 0;
+    };
+
+    PresetsManager.prototype.savePreset = function(name, curve) {
+        this.presets[name] = copyCurve(curve);
+        if (this.customNames.indexOf(name) < 0) this.customNames.push(name);
+        this.save();
+    };
+
+    PresetsManager.prototype.remove = function(name) {
+        if (!name || !this.presets[name]) {
+            console.warn("Select a preset first.");
+            return false;
+        }
+        if (!this.isCustom(name)) {
+            console.warn("Built-in presets cannot be removed.");
+            return false;
+        }
+        this.customNames.splice(this.customNames.indexOf(name), 1);
+        var favIndex = this.favoriteNames.indexOf(name);
+        if (favIndex >= 0) this.favoriteNames.splice(favIndex, 1);
+        if (this.lastUsedName === name) this.lastUsedName = "";
+        delete this.presets[name];
+        this.save();
+        console.log("Removed preset: " + name);
+        return true;
+    };
+
+    PresetsManager.prototype.toggleFavorite = function(name) {
+        if (!name || !this.presets[name]) return;
+        var index = this.favoriteNames.indexOf(name);
+        if (index >= 0) {
+            this.favoriteNames.splice(index, 1);
+        } else {
+            this.favoriteNames.push(name);
+        }
+    };
+
+    PresetsManager.prototype.remember = function(name) {
+        if (!name || !this.presets[name]) return;
+        this.lastUsedName = name;
+        this.save();
+    };
+
+    PresetsManager.prototype.sections = function() {
+        var names = this.names();
+        var sections = [
+            { title: "Favorite", names: [] },
+            { title: "Built-In", names: [] },
+            { title: "User", names: [] }
+        ];
+        for (var i = 0; i < names.length; i++) {
+            var name = names[i];
+            if (this.isFavorite(name)) {
+                sections[0].names.push(name);
+            } else if (this.isCustom(name)) {
+                sections[2].names.push(name);
+            } else {
+                sections[1].names.push(name);
+            }
+        }
+        return sections;
+    };
+
+    var CurveDrawing = {
+        points: function(curve, size, padding) {
+            var span = size - padding * 2;
+            function point(x, y) {
+                return {
+                    x: padding + clamp(x, 0, 1) * span,
+                    y: padding + clamp(y, 0, 1) * span
+                };
+            }
+            return {
+                p0: point(0, 0),
+                p1: point(curve[0], curve[1]),
+                p2: point(curve[2], curve[3]),
+                p3: point(1, 1)
+            };
+        },
+
+        drawCurve: function(draw, curve, options) {
+            var size = options.size;
+            var padding = options.padding;
+            var handleRadius = options.handleRadius || 4;
+            var pts = this.points(curve, size, padding);
+
+            var frame = new cavalry.Path();
+            frame.addRect(padding, padding, size - padding, size - padding);
+            draw.addPath(frame.toObject(), { color: COLORS.frame, stroke: true, strokeWidth: 1 });
+
+            var guide = new cavalry.Path();
+            guide.moveTo(pts.p0.x, pts.p0.y);
+            guide.lineTo(pts.p3.x, pts.p3.y);
+            draw.addPath(guide.toObject(), { color: COLORS.guide, stroke: true, strokeWidth: 1 });
+
+            var handles = new cavalry.Path();
+            handles.moveTo(pts.p0.x, pts.p0.y);
+            handles.lineTo(pts.p1.x, pts.p1.y);
+            handles.moveTo(pts.p3.x, pts.p3.y);
+            handles.lineTo(pts.p2.x, pts.p2.y);
+            draw.addPath(handles.toObject(), { color: COLORS.handles, stroke: true, strokeWidth: 1 });
+
+            var curvePath = new cavalry.Path();
+            curvePath.moveTo(pts.p0.x, pts.p0.y);
+            curvePath.cubicTo(pts.p1.x, pts.p1.y, pts.p2.x, pts.p2.y, pts.p3.x, pts.p3.y);
+            draw.addPath(curvePath.toObject(), { color: COLORS.curve, stroke: true, strokeWidth: 2 });
+
+            var endDots = new cavalry.Path();
+            endDots.addEllipse(pts.p0.x, pts.p0.y, 3, 3);
+            endDots.addEllipse(pts.p3.x, pts.p3.y, 3, 3);
+            draw.addPath(endDots.toObject(), { color: COLORS.endpoint });
+
+            var h1 = new cavalry.Path();
+            h1.addEllipse(pts.p1.x, pts.p1.y, handleRadius, handleRadius);
+            draw.addPath(h1.toObject(), { color: COLORS.p1 });
+
+            var h2 = new cavalry.Path();
+            h2.addEllipse(pts.p2.x, pts.p2.y, handleRadius, handleRadius);
+            draw.addPath(h2.toObject(), { color: COLORS.p2 });
+        },
+
+        drawFavoriteStar: function(draw, isFavorite) {
+            var starBox = new cavalry.Path();
+            starBox.addRect(58, 0, 43, 15);
+            draw.addPath(starBox.toObject(), { color: COLORS.starBox });
+
+            var star = new cavalry.Path();
+            star.moveTo(50.5, 12.5);
+            star.lineTo(52.1, 9.3);
+            star.lineTo(55.7, 8.8);
+            star.lineTo(53.1, 6.3);
+            star.lineTo(53.7, 2.7);
+            star.lineTo(50.5, 4.4);
+            star.lineTo(47.3, 2.7);
+            star.lineTo(47.9, 6.3);
+            star.lineTo(45.3, 8.8);
+            star.lineTo(48.9, 9.3);
+            star.lineTo(50.5, 12.5);
+            draw.addPath(star.toObject(), { color: COLORS.star, stroke: !isFavorite, strokeWidth: 1 });
+        }
+    };
+
+    function createPresetPreviewDraw(curve, name, callbacks) {
         var size = 58;
-        var padding = 4;
         var draw = new ui.Draw();
         draw.setSize(size, size);
-        draw.setBackgroundColor("#1d1f23");
-
-        var span = size - padding * 2;
-        function toPoint(x, y) {
-            return {
-                x: padding + clamp(x, 0, 1) * span,
-                y: padding + clamp(y, 0, 1) * span
-            };
-        }
-
-        var p0 = toPoint(0, 0);
-        var p1 = toPoint(curve[0], curve[1]);
-        var p2 = toPoint(curve[2], curve[3]);
-        var p3 = toPoint(1, 1);
-
-        var frame = new cavalry.Path();
-        frame.addRect(padding, padding, size - padding, size - padding);
-        draw.addPath(frame.toObject(), { color: "#454a52", stroke: true, strokeWidth: 1 });
-
-        var guide = new cavalry.Path();
-        guide.moveTo(p0.x, p0.y);
-        guide.lineTo(p3.x, p3.y);
-        draw.addPath(guide.toObject(), { color: "#2f333a", stroke: true, strokeWidth: 1 });
-
-        var handles = new cavalry.Path();
-        handles.moveTo(p0.x, p0.y);
-        handles.lineTo(p1.x, p1.y);
-        handles.moveTo(p3.x, p3.y);
-        handles.lineTo(p2.x, p2.y);
-        draw.addPath(handles.toObject(), { color: "#657180", stroke: true, strokeWidth: 1 });
-
-        var curvePath = new cavalry.Path();
-        curvePath.moveTo(p0.x, p0.y);
-        curvePath.cubicTo(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
-        draw.addPath(curvePath.toObject(), { color: "#4ffd7a", stroke: true, strokeWidth: 2 });
-
-        var endDots = new cavalry.Path();
-        endDots.addEllipse(p0.x, p0.y, 3, 3);
-        endDots.addEllipse(p3.x, p3.y, 3, 3);
-        draw.addPath(endDots.toObject(), { color: "#9aa4b2" });
-
-        var h1 = new cavalry.Path();
-        h1.addEllipse(p1.x, p1.y, 4, 4);
-        draw.addPath(h1.toObject(), { color: "#36c9ff" });
-
-        var h2 = new cavalry.Path();
-        h2.addEllipse(p2.x, p2.y, 4, 4);
-        draw.addPath(h2.toObject(), { color: "#ff8a3d" });
-
-        var starBox = new cavalry.Path();
-        starBox.addRect(58, 0, 43, 15);
-        draw.addPath(starBox.toObject(), { color: "#15171b" });
-
-        var star = new cavalry.Path();
-        star.moveTo(50.5, 12.5);
-        star.lineTo(52.1, 9.3);
-        star.lineTo(55.7, 8.8);
-        star.lineTo(53.1, 6.3);
-        star.lineTo(53.7, 2.7);
-        star.lineTo(50.5, 4.4);
-        star.lineTo(47.3, 2.7);
-        star.lineTo(47.9, 6.3);
-        star.lineTo(45.3, 8.8);
-        star.lineTo(48.9, 9.3);
-        star.lineTo(50.5, 12.5);
-        draw.addPath(star.toObject(), { color: "#d8d8d8", stroke: !isFavoritePreset(name), strokeWidth: 1 });
+        draw.setBackgroundColor(COLORS.background);
+        CurveDrawing.drawCurve(draw, curve, { size: size, padding: 4, handleRadius: 4 });
+        CurveDrawing.drawFavoriteStar(draw, callbacks.isFavorite(name));
 
         draw.onMousePress = function(position, button) {
             if (button !== "left") return;
             if (position.x >= 43 && position.y <= 15) {
-                toggleFavoritePreset(name);
-            } else {
-                selectLoaderPreset(name);
+                callbacks.onToggleFavorite(name);
+                return;
             }
+            callbacks.onSelect(name);
         };
 
         draw.onMouseDoubleClick = function(position, button) {
             if (button !== "left") return;
-            selectLoaderPreset(name);
-            rememberLastUsedPreset(name);
-            applyCurveToSelection(curve);
+            callbacks.onApply(name);
         };
 
         return draw;
     }
 
-    function isCustomPreset(name) {
-        return customPresetNames.indexOf(name) >= 0;
+    function CurveEditor(fields) {
+        this.fields = fields;
+        this.width = 160;
+        this.height = 160;
+        this.padding = 16;
+        this.handleRadius = 5;
+        this.dragHandle = "";
+        this.isUpdatingFieldsFromDrag = false;
+        this.pendingDragPos = null;
+        this.hasPendingDrag = false;
+        this.dragTimer = null;
+        this.curve = getCurveFromFields(fields);
+        this.draw = new ui.Draw();
+        this.draw.setSize(this.width, this.height);
+        this.draw.setBackgroundColor(COLORS.background);
+        this.bindEvents();
+        this.render();
     }
 
-    function isFavoritePreset(name) {
-        return favoritePresetNames.indexOf(name) >= 0;
-    }
+    CurveEditor.prototype.toScreenPoint = function(x, y) {
+        var span = this.width - this.padding * 2;
+        return {
+            x: this.padding + x * span,
+            y: this.padding + y * span
+        };
+    };
 
-    var pendingLoaderRebuild = false;
-    var loaderRebuildTimer = null;
+    CurveEditor.prototype.toUnitPoint = function(x, y) {
+        var span = this.width - this.padding * 2;
+        return {
+            x: clamp((x - this.padding) / span, 0, 1),
+            y: clamp((y - this.padding) / span, 0, 1)
+        };
+    };
 
-    function flushLoaderRebuild() {
-        pendingLoaderRebuild = false;
-        if (loaderRebuildTimer && typeof loaderRebuildTimer.stop === "function") {
-            loaderRebuildTimer.stop();
+    CurveEditor.prototype.distance = function(a, b) {
+        var dx = a.x - b.x;
+        var dy = a.y - b.y;
+        return Math.sqrt(dx * dx + dy * dy);
+    };
+
+    CurveEditor.prototype.render = function() {
+        this.draw.clearPaths();
+        CurveDrawing.drawCurve(this.draw, this.curve, {
+            size: this.width,
+            padding: this.padding,
+            handleRadius: this.handleRadius
+        });
+        this.draw.redraw();
+    };
+
+    CurveEditor.prototype.syncFromFields = function() {
+        this.curve = getCurveFromFields(this.fields);
+        this.render();
+    };
+
+    CurveEditor.prototype.syncToFields = function() {
+        this.curve = copyCurve(this.curve);
+        this.isUpdatingFieldsFromDrag = true;
+        updateFieldsFromCurve(this.fields, this.curve);
+        this.isUpdatingFieldsFromDrag = false;
+    };
+
+    CurveEditor.prototype.syncDraggedHandleToFields = function() {
+        if (!this.dragHandle) return;
+        this.isUpdatingFieldsFromDrag = true;
+        if (this.dragHandle === "p1") {
+            this.fields.x1.setValue(round2Unit(this.curve[0]));
+            this.fields.y1.setValue(round2Unit(this.curve[1]));
+        } else if (this.dragHandle === "p2") {
+            this.fields.x2.setValue(round2Unit(this.curve[2]));
+            this.fields.y2.setValue(round2Unit(this.curve[3]));
         }
-        savePersistedPresets();
-        rebuildLoaderGrid();
-    }
+        this.isUpdatingFieldsFromDrag = false;
+    };
 
-    function scheduleLoaderRebuild() {
-        if (pendingLoaderRebuild) return;
-        pendingLoaderRebuild = true;
-        if (typeof api.Timer !== "function") {
-            flushLoaderRebuild();
-            return;
+    CurveEditor.prototype.pickHandle = function(position) {
+        var p1 = this.toScreenPoint(this.curve[0], this.curve[1]);
+        var p2 = this.toScreenPoint(this.curve[2], this.curve[3]);
+        var d1 = this.distance(position, p1);
+        var d2 = this.distance(position, p2);
+        this.dragHandle = (d1 <= 10 || d2 <= 10) ? (d1 <= d2 ? "p1" : "p2") : "";
+    };
+
+    CurveEditor.prototype.applyPointerToCurve = function(position) {
+        if (!this.dragHandle) return false;
+        var unit = this.toUnitPoint(position.x, position.y);
+        if (this.dragHandle === "p1") {
+            if (this.curve[0] === unit.x && this.curve[1] === unit.y) return false;
+            this.curve[0] = unit.x;
+            this.curve[1] = unit.y;
+            return true;
         }
-        if (!loaderRebuildTimer) {
-            function RebuildTimerCallbacks() {
-                this.onTimeout = flushLoaderRebuild;
+        if (this.dragHandle === "p2") {
+            if (this.curve[2] === unit.x && this.curve[3] === unit.y) return false;
+            this.curve[2] = unit.x;
+            this.curve[3] = unit.y;
+            return true;
+        }
+        return false;
+    };
+
+    CurveEditor.prototype.flushPendingDrag = function() {
+        if (!this.dragHandle || !this.hasPendingDrag || !this.pendingDragPos) return;
+        var pos = this.pendingDragPos;
+        this.hasPendingDrag = false;
+        if (this.applyPointerToCurve(pos)) {
+            this.syncDraggedHandleToFields();
+            this.render();
+        }
+    };
+
+    CurveEditor.prototype.ensureDragTimer = function() {
+        if (this.dragTimer || typeof api.Timer !== "function") return;
+        var editor = this;
+        function DragTimerCallbacks() {
+            this.onTimeout = function() { editor.flushPendingDrag(); };
+        }
+        this.dragTimer = new api.Timer(new DragTimerCallbacks());
+        this.dragTimer.setRepeating(true);
+        this.dragTimer.setInterval(16);
+    };
+
+    CurveEditor.prototype.startDragTimer = function() {
+        this.ensureDragTimer();
+        if (this.dragTimer) this.dragTimer.start();
+    };
+
+    CurveEditor.prototype.stopDragTimer = function() {
+        if (this.dragTimer && typeof this.dragTimer.stop === "function") this.dragTimer.stop();
+    };
+
+    CurveEditor.prototype.bindEvents = function() {
+        var editor = this;
+        this.draw.onMousePress = function(position, button) {
+            if (button !== "left") return;
+            editor.pickHandle(position);
+            if (!editor.dragHandle) return;
+            ui.setCallbacksActive(false);
+            editor.startDragTimer();
+            if (editor.applyPointerToCurve(position)) {
+                editor.syncDraggedHandleToFields();
+                editor.render();
             }
-            loaderRebuildTimer = new api.Timer(new RebuildTimerCallbacks());
-            loaderRebuildTimer.setRepeating(false);
-            loaderRebuildTimer.setInterval(1);
-        }
-        loaderRebuildTimer.start();
+            editor.pendingDragPos = position;
+            editor.hasPendingDrag = false;
+        };
+
+        this.draw.onMouseMove = function(position) {
+            if (!editor.dragHandle) return;
+            editor.pendingDragPos = position;
+            editor.hasPendingDrag = true;
+            if (!editor.dragTimer) editor.flushPendingDrag();
+        };
+
+        this.draw.onMouseRelease = function() {
+            editor.flushPendingDrag();
+            editor.stopDragTimer();
+            editor.dragHandle = "";
+            ui.setCallbacksActive(true);
+            editor.syncToFields();
+            editor.render();
+            editor.pendingDragPos = null;
+            editor.hasPendingDrag = false;
+        };
+    };
+
+    CurveEditor.prototype.resize = function(newSize) {
+        var clampedSize = Math.max(170, Math.min(400, Math.round(newSize)));
+        if (clampedSize === this.width && clampedSize === this.height) return;
+        this.width = clampedSize;
+        this.height = clampedSize;
+        this.draw.setSize(this.width, this.height);
+        this.render();
+    };
+
+    function parseSelectedPath(path) {
+        var firstDot = path.indexOf(".");
+        if (firstDot < 0) return null;
+        return {
+            layerId: path.substring(0, firstDot),
+            attrId: path.substring(firstDot + 1)
+        };
     }
 
-    function toggleFavoritePreset(name) {
-        if (!name || !internalPresets[name]) return;
-        var index = favoritePresetNames.indexOf(name);
-        if (index >= 0) {
-            favoritePresetNames.splice(index, 1);
+    function getValueAtFrame(layerId, attrId, frame, originalFrame) {
+        api.setFrame(frame);
+        var value = api.get(layerId, attrId);
+        api.setFrame(originalFrame);
+        return typeof value === "number" ? value : NaN;
+    }
+
+    function applyCurveToSelection(curve) {
+        var x1 = round2Unit(curve[0]);
+        var y1 = round2Unit(curve[1]);
+        var x2 = round2Unit(curve[2]);
+        var y2 = round2Unit(curve[3]);
+        var selected = api.getSelectedKeyframes();
+        var totalKeys = 0;
+        var totalAttrs = 0;
+        var currentFrame = api.getFrame();
+
+        for (var path in selected) {
+            if (!Object.prototype.hasOwnProperty.call(selected, path)) continue;
+            var parsed = parseSelectedPath(path);
+            if (!parsed) continue;
+            var selectedFrames = selected[path];
+            if (!Array.isArray(selectedFrames) || selectedFrames.length === 0) continue;
+            var selectedFrameMap = {};
+            for (var s = 0; s < selectedFrames.length; s++) selectedFrameMap[selectedFrames[s]] = true;
+            var allFrames = api.getKeyframeTimes(parsed.layerId, parsed.attrId);
+            if (!Array.isArray(allFrames) || allFrames.length === 0) continue;
+            allFrames.sort(function(a, b) { return a - b; });
+            totalAttrs += 1;
+
+            for (var i = 0; i < selectedFrames.length; i++) {
+                var frame = selectedFrames[i];
+                var index = allFrames.indexOf(frame);
+                if (index < 0) continue;
+
+                var keyData = {};
+                keyData[parsed.attrId] = { frame: frame, type: 0 };
+                api.modifyKeyframe(parsed.layerId, keyData);
+
+                var unlockData = {};
+                unlockData[parsed.attrId] = { frame: frame, angleLocked: false, weightLocked: false };
+                api.modifyKeyframeTangent(parsed.layerId, unlockData);
+
+                var currentValue = getValueAtFrame(parsed.layerId, parsed.attrId, frame, currentFrame);
+                if (isNaN(currentValue)) continue;
+
+                if (index < allFrames.length - 1) {
+                    var nextFrame = allFrames[index + 1];
+                    var nextValue = getValueAtFrame(parsed.layerId, parsed.attrId, nextFrame, currentFrame);
+                    if (selectedFrameMap[nextFrame] && !isNaN(nextValue)) {
+                        var outData = {};
+                        outData[parsed.attrId] = {
+                            frame: frame,
+                            outHandle: true,
+                            angleLocked: false,
+                            weightLocked: false,
+                            xValue: frame + (nextFrame - frame) * x1,
+                            yValue: currentValue + (nextValue - currentValue) * y1
+                        };
+                        api.modifyKeyframeTangent(parsed.layerId, outData);
+                    }
+                }
+
+                if (index > 0) {
+                    var prevFrame = allFrames[index - 1];
+                    var prevValue = getValueAtFrame(parsed.layerId, parsed.attrId, prevFrame, currentFrame);
+                    if (selectedFrameMap[prevFrame] && !isNaN(prevValue)) {
+                        var inData = {};
+                        inData[parsed.attrId] = {
+                            frame: frame,
+                            inHandle: true,
+                            angleLocked: false,
+                            weightLocked: false,
+                            xValue: prevFrame + (frame - prevFrame) * x2,
+                            yValue: prevValue + (currentValue - prevValue) * y2
+                        };
+                        api.modifyKeyframeTangent(parsed.layerId, inData);
+                    }
+                }
+                totalKeys += 1;
+            }
+        }
+
+        api.setFrame(currentFrame);
+        if (totalKeys === 0) {
+            console.warn("No numeric selected keyframes found.");
         } else {
-            favoritePresetNames.push(name);
+            console.log("Applied curve to " + totalKeys + " keyframe(s) across " + totalAttrs + " attribute(s).");
         }
-        scheduleLoaderRebuild();
     }
 
-    function makeSectionHeader(text) {
+    function PresetBrowserView(manager, callbacks) {
+        this.manager = manager;
+        this.callbacks = callbacks;
+        this.cardWidgets = {};
+        this.selectedName = "";
+        this.grid = null;
+        this.scroll = new ui.ScrollView();
+        this.scroll.setFixedHeight(300);
+        this.scroll.alwaysShowVerticalScrollBar();
+        this.rebuild();
+    }
+
+    PresetBrowserView.prototype.makeHeader = function(text) {
         var label = new ui.Label(text);
         label.setFontSize(10);
-        label.setTextColor("#b8c0cc");
+        label.setTextColor(COLORS.header);
         return label;
-    }
+    };
 
-    function makePresetCard(name, curve) {
+    PresetBrowserView.prototype.makeCard = function(name) {
         var card = new ui.Container();
-        card.setBackgroundColor("#23262c");
+        card.setBackgroundColor(COLORS.card);
         card.setContentsMargins(1, 1, 1, 1);
         card.setSize(66, 80);
 
-        var preview = createPresetPreviewDraw(curve, name);
+        var view = this;
+        var preview = createPresetPreviewDraw(this.manager.curve(name), name, {
+            isFavorite: function(presetName) { return view.manager.isFavorite(presetName); },
+            onToggleFavorite: this.callbacks.onToggleFavorite,
+            onSelect: function(presetName) { view.select(presetName); },
+            onApply: this.callbacks.onApply
+        });
+
         var nameLabel = new ui.Label(shortenName(name, 10));
-        nameLabel.setTextColor("#e8e8e8");
+        nameLabel.setTextColor(COLORS.text);
         nameLabel.setAlignment(1);
         nameLabel.setFontSize(10);
         nameLabel.setToolTip(name);
@@ -448,409 +741,113 @@
         card.setLayout(layout);
 
         card.onMousePress = function(position, button) {
-            if (button === "left") selectLoaderPreset(name);
+            if (button === "left") view.select(name);
         };
-
         card.onMouseDoubleClick = function(position, button) {
-            if (button === "left") {
-                selectLoaderPreset(name);
-                applyCurveToSelection(curve);
-            }
+            if (button === "left") view.callbacks.onApply(name);
         };
-
         return card;
-    }
+    };
 
-    function rebuildLoaderGrid() {
-        loaderCardWidgets = {};
-        loaderGrid = new ui.VLayout();
-        loaderGrid.setSpaceBetween(1);
-        var names = Object.keys(internalPresets);
-        names.sort();
+    PresetBrowserView.prototype.rebuild = function() {
+        this.cardWidgets = {};
+        this.grid = new ui.VLayout();
+        this.grid.setSpaceBetween(1);
+        this.manager.prune();
 
-        function addSection(title, sectionNames) {
-            if (sectionNames.length === 0) return;
+        var sections = this.manager.sections();
+        for (var s = 0; s < sections.length; s++) {
+            var section = sections[s];
+            if (section.names.length === 0) continue;
             var sectionGrid = new ui.FlowLayout(0, 0);
             sectionGrid.setSpaceBetween(0);
             sectionGrid.setMargins(1, 1, 1, 1);
-            loaderGrid.add(makeSectionHeader(title));
-            for (var i = 0; i < sectionNames.length; i++) {
-                var name = sectionNames[i];
-                var card = makePresetCard(name, internalPresets[name]);
-                loaderCardWidgets[name] = card;
+            this.grid.add(this.makeHeader(section.title));
+            for (var i = 0; i < section.names.length; i++) {
+                var name = section.names[i];
+                var card = this.makeCard(name);
+                this.cardWidgets[name] = card;
                 sectionGrid.add(card);
             }
-            loaderGrid.add(sectionGrid);
+            this.grid.add(sectionGrid);
         }
 
-        var favoriteNames = [];
-        var builtInNames = [];
-        var userNames = [];
+        var names = this.manager.names();
+        if (names.length === 0) this.grid.add(this.makeHeader("No Presets"));
+        if (!this.selectedName || !this.manager.has(this.selectedName)) {
+            this.selectedName = names.length > 0 ? names[0] : "";
+        }
+
+        this.refreshSelection();
+        this.scroll.setLayout(this.grid);
+    };
+
+    PresetBrowserView.prototype.refreshSelection = function() {
+        var names = Object.keys(this.cardWidgets);
         for (var i = 0; i < names.length; i++) {
             var name = names[i];
-            if (isFavoritePreset(name)) {
-                favoriteNames.push(name);
-            } else if (isCustomPreset(name)) {
-                userNames.push(name);
-            } else {
-                builtInNames.push(name);
-            }
-        }
-
-        addSection("Favorite", favoriteNames);
-        addSection("Built-In", builtInNames);
-        addSection("User", userNames);
-
-        if (names.length === 0) {
-            loaderGrid.add(makeSectionHeader("No Presets"));
-        }
-
-        for (var c = customPresetNames.length - 1; c >= 0; c--) {
-            if (!internalPresets[customPresetNames[c]]) customPresetNames.splice(c, 1);
-        }
-        for (var f = favoritePresetNames.length - 1; f >= 0; f--) {
-            if (!internalPresets[favoritePresetNames[f]]) favoritePresetNames.splice(f, 1);
-        }
-
-        if (!loaderSelectedPresetName || !internalPresets[loaderSelectedPresetName]) {
-            loaderSelectedPresetName = names.length > 0 ? names[0] : "";
-        }
-
-        refreshLoaderSelectionUI();
-
-        if (loaderScroll) {
-            loaderScroll.setLayout(loaderGrid);
-        }
-    }
-
-    function refreshLoaderSelectionUI() {
-        var names = Object.keys(loaderCardWidgets);
-        for (var i = 0; i < names.length; i++) {
-            var name = names[i];
-            var card = loaderCardWidgets[name];
+            var card = this.cardWidgets[name];
             if (!card) continue;
-            if (name === loaderSelectedPresetName) {
-                card.setBackgroundColor("#2f3340");
-            } else {
-                card.setBackgroundColor("#23262c");
-            }
+            card.setBackgroundColor(name === this.selectedName ? COLORS.selectedCard : COLORS.card);
         }
-    }
+    };
+
+    PresetBrowserView.prototype.select = function(name) {
+        this.selectedName = name;
+        this.refreshSelection();
+    };
+
+    PresetBrowserView.prototype.selected = function() {
+        return this.selectedName;
+    };
+
+    PresetBrowserView.prototype.setHeight = function(height) {
+        this.scroll.setFixedHeight(height);
+    };
+
+    var presetManager = new PresetsManager(BUILT_IN_PRESETS, PRESET_STORAGE_FILE);
+    presetManager.load();
+
+    var presetBrowser = null;
+    var curveEditor = null;
+    var tabView = null;
+    var savePresetInput = null;
+    var loaderRebuildTask = null;
 
     function selectLoaderPreset(name) {
-        loaderSelectedPresetName = name;
-        refreshLoaderSelectionUI();
+        if (presetBrowser) presetBrowser.select(name);
     }
 
     function rememberLastUsedPreset(name) {
-        if (!name || !internalPresets[name]) return;
-        lastUsedPresetName = name;
-        savePersistedPresets();
+        presetManager.remember(name);
     }
 
-    function removeLoaderPreset(name) {
-        if (!name || !internalPresets[name]) {
+    function toggleFavoritePreset(name) {
+        presetManager.toggleFavorite(name);
+        if (loaderRebuildTask) loaderRebuildTask.schedule();
+    }
+
+    function applyPresetByName(name) {
+        var curve = presetManager.curve(name);
+        if (!curve) return;
+        selectLoaderPreset(name);
+        rememberLastUsedPreset(name);
+        applyCurveToSelection(curve);
+    }
+
+    function loadPresetIntoEditor(name) {
+        var curve = presetManager.curve(name);
+        if (!curve) {
             console.warn("Select a preset first.");
             return;
         }
-        var customIndex = customPresetNames.indexOf(name);
-        if (customIndex < 0) {
-            console.warn("Built-in presets cannot be removed.");
-            return;
-        }
-        customPresetNames.splice(customIndex, 1);
-        var favoriteIndex = favoritePresetNames.indexOf(name);
-        if (favoriteIndex >= 0) favoritePresetNames.splice(favoriteIndex, 1);
-        if (lastUsedPresetName === name) lastUsedPresetName = "";
-        delete internalPresets[name];
-        savePersistedPresets();
-        loaderSelectedPresetName = "";
-        rebuildLoaderGrid();
-        console.log("Removed preset: " + name);
-    }
-
-    function loadLoaderPresetIntoEditor(name) {
-        if (!name || !internalPresets[name]) return;
-        updateFieldsFromCurve(fields, internalPresets[name]);
+        updateFieldsFromCurve(fields, curve);
         curveEditor.syncFromFields();
-        if (savePresetInput && typeof savePresetInput.setText === "function") {
-            savePresetInput.setText(name);
-        }
+        safeSetText(savePresetInput, name);
         selectLoaderPreset(name);
         rememberLastUsedPreset(name);
-        if (tabView && typeof tabView.setTab === "function") {
-            tabView.setTab(0);
-        }
+        if (tabView && typeof tabView.setTab === "function") tabView.setTab(0);
     }
-
-    function makeCurveEditorWidget(fields) {
-        var editor = {};
-        editor.width = 160;
-        editor.height = 160;
-        editor.padding = 16;
-        editor.handleRadius = 5;
-        editor.dragHandle = "";
-        editor.isDragging = false;
-        editor.isUpdatingFieldsFromDrag = false;
-        editor.pendingDragPos = null;
-        editor.hasPendingDrag = false;
-        editor.dragTimer = null;
-        editor.curve = [
-            round2Unit(fields.x1.getValue()),
-            round2Unit(fields.y1.getValue()),
-            round2Unit(fields.x2.getValue()),
-            round2Unit(fields.y2.getValue())
-        ];
-        editor.draw = new ui.Draw();
-        editor.draw.setSize(editor.width, editor.height);
-        editor.draw.setBackgroundColor("#1d1f23");
-
-        editor.toScreenPoint = function(x, y) {
-            var spanX = editor.width - editor.padding * 2;
-            var spanY = editor.height - editor.padding * 2;
-            return {
-                x: editor.padding + x * spanX,
-                y: editor.padding + y * spanY
-            };
-        };
-
-        editor.toUnitPoint = function(x, y) {
-            var spanX = editor.width - editor.padding * 2;
-            var spanY = editor.height - editor.padding * 2;
-            var ux = (x - editor.padding) / spanX;
-            var uy = (y - editor.padding) / spanY;
-            return {
-                x: clamp(ux, 0, 1),
-                y: clamp(uy, 0, 1)
-            };
-        };
-
-        editor.distance = function(a, b) {
-            var dx = a.x - b.x;
-            var dy = a.y - b.y;
-            return Math.sqrt(dx * dx + dy * dy);
-        };
-
-        editor.render = function() {
-            editor.draw.clearPaths();
-
-            var p0 = editor.toScreenPoint(0, 0);
-            var p1 = editor.toScreenPoint(editor.curve[0], editor.curve[1]);
-            var p2 = editor.toScreenPoint(editor.curve[2], editor.curve[3]);
-            var p3 = editor.toScreenPoint(1, 1);
-
-            var frame = new cavalry.Path();
-            frame.addRect(editor.padding, editor.padding, editor.width - editor.padding, editor.height - editor.padding);
-            editor.draw.addPath(frame.toObject(), { color: "#454a52", stroke: true, strokeWidth: 1 });
-
-            var guide = new cavalry.Path();
-            guide.moveTo(p0.x, p0.y);
-            guide.lineTo(p3.x, p3.y);
-            editor.draw.addPath(guide.toObject(), { color: "#2f333a", stroke: true, strokeWidth: 1 });
-
-            var handles = new cavalry.Path();
-            handles.moveTo(p0.x, p0.y);
-            handles.lineTo(p1.x, p1.y);
-            handles.moveTo(p3.x, p3.y);
-            handles.lineTo(p2.x, p2.y);
-            editor.draw.addPath(handles.toObject(), { color: "#657180", stroke: true, strokeWidth: 1 });
-
-            var curvePath = new cavalry.Path();
-            curvePath.moveTo(p0.x, p0.y);
-            curvePath.cubicTo(p1.x, p1.y, p2.x, p2.y, p3.x, p3.y);
-            editor.draw.addPath(curvePath.toObject(), { color: "#4ffd7a", stroke: true, strokeWidth: 2 });
-
-            var endDots = new cavalry.Path();
-            endDots.addEllipse(p0.x, p0.y, 3, 3);
-            endDots.addEllipse(p3.x, p3.y, 3, 3);
-            editor.draw.addPath(endDots.toObject(), { color: "#9aa4b2" });
-
-            var h1 = new cavalry.Path();
-            h1.addEllipse(p1.x, p1.y, editor.handleRadius, editor.handleRadius);
-            editor.draw.addPath(h1.toObject(), { color: "#36c9ff" });
-
-            var h2 = new cavalry.Path();
-            h2.addEllipse(p2.x, p2.y, editor.handleRadius, editor.handleRadius);
-            editor.draw.addPath(h2.toObject(), { color: "#ff8a3d" });
-
-            editor.draw.redraw();
-        };
-
-        editor.syncFromFields = function() {
-            editor.curve = [
-                round2Unit(fields.x1.getValue()),
-                round2Unit(fields.y1.getValue()),
-                round2Unit(fields.x2.getValue()),
-                round2Unit(fields.y2.getValue())
-            ];
-            editor.render();
-        };
-
-        editor.syncToFields = function() {
-            editor.curve[0] = round2Unit(editor.curve[0]);
-            editor.curve[1] = round2Unit(editor.curve[1]);
-            editor.curve[2] = round2Unit(editor.curve[2]);
-            editor.curve[3] = round2Unit(editor.curve[3]);
-            editor.isUpdatingFieldsFromDrag = true;
-            fields.x1.setValue(editor.curve[0]);
-            fields.y1.setValue(editor.curve[1]);
-            fields.x2.setValue(editor.curve[2]);
-            fields.y2.setValue(editor.curve[3]);
-            editor.isUpdatingFieldsFromDrag = false;
-        };
-
-        editor.syncDraggedHandleToFields = function() {
-            if (!editor.dragHandle) return;
-            editor.isUpdatingFieldsFromDrag = true;
-            if (editor.dragHandle === "p1") {
-                fields.x1.setValue(round2Unit(editor.curve[0]));
-                fields.y1.setValue(round2Unit(editor.curve[1]));
-            } else if (editor.dragHandle === "p2") {
-                fields.x2.setValue(round2Unit(editor.curve[2]));
-                fields.y2.setValue(round2Unit(editor.curve[3]));
-            }
-            editor.isUpdatingFieldsFromDrag = false;
-        };
-
-        editor.applyPointerToCurve = function(position) {
-            if (!editor.dragHandle) return false;
-            var unit = editor.toUnitPoint(position.x, position.y);
-            var nx = unit.x;
-            var ny = unit.y;
-            if (editor.dragHandle === "p1") {
-                if (editor.curve[0] === nx && editor.curve[1] === ny) return false;
-                editor.curve[0] = nx;
-                editor.curve[1] = ny;
-                return true;
-            }
-            if (editor.dragHandle === "p2") {
-                if (editor.curve[2] === nx && editor.curve[3] === ny) return false;
-                editor.curve[2] = nx;
-                editor.curve[3] = ny;
-                return true;
-            }
-            return false;
-        };
-
-        editor.flushPendingDrag = function() {
-            if (!editor.dragHandle || !editor.hasPendingDrag || !editor.pendingDragPos) return;
-            var pos = editor.pendingDragPos;
-            editor.hasPendingDrag = false;
-            if (editor.applyPointerToCurve(pos)) {
-                editor.syncDraggedHandleToFields();
-                editor.render();
-            }
-        };
-
-        function DragTimerCallbacks() {
-            this.onTimeout = function() {
-                editor.flushPendingDrag();
-            };
-        }
-
-        editor.ensureDragTimer = function() {
-            if (editor.dragTimer || typeof api.Timer !== "function") return;
-            editor.dragTimer = new api.Timer(new DragTimerCallbacks());
-            editor.dragTimer.setRepeating(true);
-            editor.dragTimer.setInterval(16);
-        };
-
-        editor.startDragTimer = function() {
-            editor.ensureDragTimer();
-            if (editor.dragTimer) {
-                editor.dragTimer.start();
-            }
-        };
-
-        editor.stopDragTimer = function() {
-            if (editor.dragTimer && typeof editor.dragTimer.stop === "function") {
-                editor.dragTimer.stop();
-            }
-        };
-
-        editor.pickHandle = function(position) {
-            var p1 = editor.toScreenPoint(editor.curve[0], editor.curve[1]);
-            var p2 = editor.toScreenPoint(editor.curve[2], editor.curve[3]);
-            var hitRadius = 10;
-            var d1 = editor.distance(position, p1);
-            var d2 = editor.distance(position, p2);
-            if (d1 <= hitRadius || d2 <= hitRadius) {
-                editor.dragHandle = d1 <= d2 ? "p1" : "p2";
-            } else {
-                editor.dragHandle = "";
-            }
-        };
-
-        editor.draw.onMousePress = function(position, button) {
-            if (button !== "left") return;
-            editor.pickHandle(position);
-            if (!editor.dragHandle) return;
-            editor.isDragging = true;
-            ui.setCallbacksActive(false);
-            editor.startDragTimer();
-            if (editor.applyPointerToCurve(position)) {
-                editor.syncDraggedHandleToFields();
-                editor.render();
-            }
-            editor.pendingDragPos = position;
-            editor.hasPendingDrag = false;
-        };
-        editor.draw.onMouseMove = function(position) {
-            if (!editor.dragHandle) return;
-            editor.pendingDragPos = position;
-            editor.hasPendingDrag = true;
-            if (!editor.dragTimer) {
-                editor.flushPendingDrag();
-            }
-        };
-        editor.draw.onMouseRelease = function() {
-            editor.flushPendingDrag();
-            editor.stopDragTimer();
-            editor.dragHandle = "";
-            editor.isDragging = false;
-            ui.setCallbacksActive(true);
-            editor.syncToFields();
-            editor.render();
-            editor.pendingDragPos = null;
-            editor.hasPendingDrag = false;
-        };
-
-        editor.resize = function(newSize) {
-            var clampedSize = Math.max(170, Math.min(400, Math.round(newSize)));
-            if (clampedSize === editor.width && clampedSize === editor.height) return;
-            editor.width = clampedSize;
-            editor.height = clampedSize;
-            editor.draw.setSize(editor.width, editor.height);
-            editor.render();
-        };
-
-        editor.render();
-        return editor;
-    }
-
-    function getWindowWidth() {
-        try {
-            if (typeof ui.size === "function") {
-                var s = ui.size();
-                if (s && typeof s.width === "number") return s.width;
-                if (s && typeof s.x === "number") return s.x;
-            } else if (ui.size && typeof ui.size.width === "number") {
-                return ui.size.width;
-            } else if (ui.size && typeof ui.size.x === "number") {
-                return ui.size.x;
-            }
-        } catch (err) { }
-        return 360;
-    }
-
-    var loaderCardWidgets = {};
-    var loaderGrid = null;
-    var loaderScroll = null;
-    var loaderSelectedPresetName = "";
-    var curveEditor = null;
-    var tabView = null;
-
-    loadPersistedPresets();
 
     ui.setTitle("KeyframeCurve");
     ui.setMinimumWidth(240);
@@ -861,10 +858,10 @@
     var y1Label = new ui.Label("y1");
     var x2Label = new ui.Label("x2");
     var y2Label = new ui.Label("y2");
-    x1Label.setTextColor("#36c9ff");
-    y1Label.setTextColor("#36c9ff");
-    x2Label.setTextColor("#ff8a3d");
-    y2Label.setTextColor("#ff8a3d");
+    x1Label.setTextColor(COLORS.p1);
+    y1Label.setTextColor(COLORS.p1);
+    x2Label.setTextColor(COLORS.p2);
+    y2Label.setTextColor(COLORS.p2);
 
     var fields = {
         x1: makeNumericField(0.25),
@@ -876,22 +873,18 @@
     fields.y1.setMin(0); fields.y1.setMax(1);
     fields.x2.setMin(0); fields.x2.setMax(1);
     fields.y2.setMin(0); fields.y2.setMax(1);
-    fields.x1.setFixedHeight(18);
-    fields.y1.setFixedHeight(18);
-    fields.x2.setFixedHeight(18);
-    fields.y2.setFixedHeight(18);
 
-    curveEditor = makeCurveEditorWidget(fields);
+    curveEditor = new CurveEditor(fields);
 
-    var savePresetInput = new ui.LineEdit();
+    savePresetInput = new ui.LineEdit();
     savePresetInput.setPlaceholder("Preset name");
     savePresetInput.setFixedHeight(18);
     var savePresetButton = new ui.Button("Save Preset");
     savePresetButton.setFixedHeight(18);
-    
+
     var applyButton = new ui.Button("Apply");
     applyButton.setFixedHeight(18);
-        
+
     var graphRow = new ui.HLayout();
     graphRow.addStretch();
     graphRow.add(curveEditor.draw);
@@ -920,35 +913,38 @@
     editorLayout.add(saveRow);
     editorLayout.add(applyButton);
 
-    loaderScroll = new ui.ScrollView();
-    loaderScroll.setFixedHeight(300);
-    loaderScroll.alwaysShowVerticalScrollBar();
-    rebuildLoaderGrid();
+    presetBrowser = new PresetBrowserView(presetManager, {
+        onToggleFavorite: toggleFavoritePreset,
+        onApply: applyPresetByName
+    });
+    loaderRebuildTask = new DeferredTask(function() {
+        presetManager.save();
+        presetBrowser.rebuild();
+    }, 1);
 
     var loaderApplyButton = new ui.Button("Apply");
     loaderApplyButton.onClick = function() {
-        if (!loaderSelectedPresetName || !internalPresets[loaderSelectedPresetName]) {
+        var selectedName = presetBrowser.selected();
+        if (!selectedName || !presetManager.has(selectedName)) {
             console.warn("Select a preset first.");
             return;
         }
-        rememberLastUsedPreset(loaderSelectedPresetName);
-        applyCurveToSelection(internalPresets[loaderSelectedPresetName]);
+        applyPresetByName(selectedName);
     };
     loaderApplyButton.setFixedHeight(18);
 
     var loaderLoadButton = new ui.Button("Load");
     loaderLoadButton.onClick = function() {
-        if (!loaderSelectedPresetName || !internalPresets[loaderSelectedPresetName]) {
-            console.warn("Select a preset first.");
-            return;
-        }
-        loadLoaderPresetIntoEditor(loaderSelectedPresetName);
+        loadPresetIntoEditor(presetBrowser.selected());
     };
     loaderLoadButton.setFixedHeight(18);
 
     var loaderRemoveButton = new ui.Button("Remove");
     loaderRemoveButton.onClick = function() {
-        removeLoaderPreset(loaderSelectedPresetName);
+        if (presetManager.remove(presetBrowser.selected())) {
+            presetBrowser.select("");
+            presetBrowser.rebuild();
+        }
     };
     loaderRemoveButton.setFixedHeight(18);
 
@@ -960,7 +956,7 @@
 
     var loaderLayout = new ui.VLayout();
     loaderLayout.setSpaceBetween(5);
-    loaderLayout.add(loaderScroll);
+    loaderLayout.add(presetBrowser.scroll);
     loaderLayout.add(loaderButtonRow);
 
     tabView = new ui.TabView();
@@ -969,13 +965,12 @@
 
     ui.add(tabView);
 
-    if (lastUsedPresetName && internalPresets[lastUsedPresetName]) {
-        updateFieldsFromCurve(fields, internalPresets[lastUsedPresetName]);
+    if (presetManager.lastUsedName && presetManager.has(presetManager.lastUsedName)) {
+        var lastCurve = presetManager.curve(presetManager.lastUsedName);
+        updateFieldsFromCurve(fields, lastCurve);
         curveEditor.syncFromFields();
-        if (savePresetInput && typeof savePresetInput.setText === "function") {
-            savePresetInput.setText(lastUsedPresetName);
-        }
-        selectLoaderPreset(lastUsedPresetName);
+        safeSetText(savePresetInput, presetManager.lastUsedName);
+        selectLoaderPreset(presetManager.lastUsedName);
     }
 
     function updateLayoutSizes() {
@@ -983,8 +978,7 @@
         var graphSize = Math.floor(Math.min(size.width - 12, size.height - 100));
         graphSize = Math.max(170, Math.min(400, graphSize));
         curveEditor.resize(graphSize);
-        var loaderHeight = Math.max(80, size.height - 58);
-        loaderScroll.setFixedHeight(loaderHeight);
+        presetBrowser.setHeight(Math.max(80, size.height - 58));
     }
 
     savePresetButton.onClick = function() {
@@ -993,10 +987,8 @@
             console.warn("Enter a preset name first.");
             return;
         }
-        internalPresets[name] = getCurveFromFields(fields);
-        if (customPresetNames.indexOf(name) < 0) customPresetNames.push(name);
-        savePersistedPresets();
-        rebuildLoaderGrid();
+        presetManager.savePreset(name, getCurveFromFields(fields));
+        presetBrowser.rebuild();
         selectLoaderPreset(name);
         console.log("Saved internal preset: " + name);
     };
